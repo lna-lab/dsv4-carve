@@ -11,4 +11,4 @@ RUN pip install --no-deps /opt/vllm-exl3
 COPY recipe/scripts /opt/recipe
 COPY recipe-lna /opt/recipe-lna
 RUN python3 /opt/recipe/patch_dsv4_stock028.py && python3 /opt/recipe/patch_dsv4_vl_stream_load.py && python3 /opt/recipe/patch_dsv4_vl_sm120_wide_swa.py \
- && python3 /opt/recipe-lna/patch_dsv4_dense_exl3.py
+ && python3 /opt/recipe-lna/patch_dsv4_dense_exl3.py && python3 /opt/recipe-lna/patch_dsv4_attention_compressor_exl3.py
