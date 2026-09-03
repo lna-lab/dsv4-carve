@@ -765,8 +765,9 @@ def plan_merge(work: Path, experts: Path, args, *, require_complete: bool = True
     index = overlay.output_index(source, dropped, new_plan)
     # layer_overlay's generic planner uses its historical shard name; T4 has
     # a distinct dense shard so it cannot be confused with a layer overlay.
-    index["weight_map"] = {
-        name: (DENSE_SHARD if filename == overlay.NEW_SHARD else filename)
+    new_targets = {item["target"] for item in new_plan}  # LNA-LAB: only the dense tensors go to the dense shard;
+    index["weight_map"] = {                                # the base pack may itself carry a layer_overlay shard of that name
+        name: (DENSE_SHARD if (filename == overlay.NEW_SHARD and name in new_targets) else filename)
         for name, filename in index["weight_map"].items()
     }
     return {
