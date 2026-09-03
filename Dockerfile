@@ -9,4 +9,6 @@ RUN pip install ninja 2>&1 | tail -1 && pip install --no-build-isolation --no-de
 COPY vllm-exl3 /opt/vllm-exl3
 RUN pip install --no-deps /opt/vllm-exl3
 COPY recipe/scripts /opt/recipe
-RUN python3 /opt/recipe/patch_dsv4_stock028.py && python3 /opt/recipe/patch_dsv4_vl_stream_load.py && python3 /opt/recipe/patch_dsv4_vl_sm120_wide_swa.py
+COPY recipe-lna /opt/recipe-lna
+RUN python3 /opt/recipe/patch_dsv4_stock028.py && python3 /opt/recipe/patch_dsv4_vl_stream_load.py && python3 /opt/recipe/patch_dsv4_vl_sm120_wide_swa.py \
+ && python3 /opt/recipe-lna/patch_dsv4_dense_exl3.py

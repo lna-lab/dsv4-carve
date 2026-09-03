@@ -103,6 +103,7 @@ The generated `quantization_config.non_routed_exl3` follows the plugin schema:
 ```text
 model.layers.N.attn.fused_wqa_wkv
 model.layers.N.attn.wq_b
+model.layers.N.attn.wo_a
 model.layers.N.attn.wo_b
 model.layers.N.attn.compressor.fused_wkv_wgate
 model.layers.N.attn.indexer.compressor.fused_wkv_wgate
@@ -112,25 +113,19 @@ model.layers.N.mlp.shared_experts.down_proj
 ```
 
 The two source tensors of each fused module are represented by one config
-entry and must have the same K. Change the two assumptions with `--vllm-root`
-and `--vllm-shared-prefix`. The Docker image containing the DSV4 vLLM model
-was not readable in this environment (Docker socket access was denied), and no
+entry and must have the same K. `wo_a.slice.0..7` is represented by one
+`model.layers.N.attn.wo_a` entry; the serving patch maps each slice number to
+its TP rank. Change the two path assumptions with `--vllm-root` and
+`--vllm-shared-prefix`. The Docker image containing the DSV4 vLLM model was
+not readable in this environment (Docker socket access was denied), and no
 local `vllm/models/deepseek_v4/nvidia/model.py` was present; the prefixes above
 therefore remain an explicit assumption to validate in the serving image.
 
-The local T5-side audit also found current runtime/plugin gaps: the fused
-attention module ignores `disable_tp`, compressor modules currently expose no
-quantization config, and replicated `indexer.wq_b` has no EXL3 path. The config
-declaration records the intended mapping, but these serving-path changes must
-land before claiming a working TP=8 load. `weights_proj` remains native BF16 by
-design.
-
-`wo_a.slice.0..7` is written to the dense shard and its original `.weight` is
-dropped, but it is intentionally not put into `non_routed_exl3.layers`. The
-DSV4 vLLM `_o_proj`/`o_groups` einsum path must be checked for EXL3 shard
-consumption or taught by a plugin change. The generated config records this as
-`non_routed_exl3.wo_a.status = "unresolved"`; this is the open serving risk,
-not a silent mapping.
+The serving recipe supplies the remaining runtime changes: effective TP for
+replicated/`disable_tp` linears, rank-local EXL3 `wo_a` slices, the compressor's
+real quantization config, and the DSV4 `_o_proj` EXL3 branch. `weights_proj`
+remains native BF16 by design because it is not in the target list and the
+pack uses `non_routed_dtype_policy: "bf16_as_stored"`.
 
 ## Source functions reused
 

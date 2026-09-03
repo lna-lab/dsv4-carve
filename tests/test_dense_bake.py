@@ -81,7 +81,11 @@ class DenseFilterTests(unittest.TestCase):
         self.assertEqual(layers["model.layers.0.attn.fused_wqa_wkv"], {"bits": 3})
         self.assertEqual(layers["model.layers.0.attn.compressor.fused_wkv_wgate"], {"bits": 3})
         self.assertEqual(layers["model.layers.0.mlp.shared_experts.gate_up_proj"], {"bits": 5})
-        self.assertNotIn("wo_a", " ".join(layers))
+        self.assertEqual(layers["model.layers.0.attn.wo_a"], {"bits": 3})
+        self.assertEqual(
+            config["quantization_config"]["non_routed_dtype_policy"],
+            "bf16_as_stored",
+        )
 
 
 class LocalPackTests(unittest.TestCase):
