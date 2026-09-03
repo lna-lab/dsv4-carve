@@ -744,7 +744,10 @@ def plan_merge(work: Path, experts: Path, args, *, require_complete: bool = True
             "WARNING dry-run merge is partial: "
             f"missing={missing_work[:3]} extra={extra_work[:3]}"
         )
-    dropped = {f"{base}.weight" for base in dense_bases}
+    dropped = set()  # LNA-LAB: the 8 wo_a slices replace the single source wo_a.weight
+    for base in dense_bases:
+        m = re.match(r"^(layers\.[0-9]+\.attn\.wo_a)\.slice\.[0-7]$", base)
+        dropped.add(f"{m.group(1)}.weight" if m else f"{base}.weight")
     missing = sorted(name for name in dropped if name not in source)
     if missing:
         raise RuntimeError(f"dense work tensor has no BF16/fp8 source weight to replace: {missing[0]}")
