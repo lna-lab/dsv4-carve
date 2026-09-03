@@ -25,7 +25,7 @@ for name, prompt in P.items():
             d = json.loads(line[5:])
             if d.get("usage"): toks = d["usage"]["completion_tokens"]
             ch = d.get("choices") or []
-            if ch and (ch[0]["delta"].get("content") or ch[0]["delta"].get("reasoning_content")):
+            if ch and (ch[0]["delta"].get("content") or (ch[0]["delta"].get("reasoning_content") or ch[0]["delta"].get("reasoning"))):
                 if first is None: first = time.time()
                 text += ch[0]["delta"].get("content") or ""
     wall = time.time() - t0; m1 = metrics()
