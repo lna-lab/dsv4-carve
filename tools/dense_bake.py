@@ -896,7 +896,9 @@ def main(argv=None) -> int:
             if args.dry_run:
                 dry_run_layout(Path(args.src).expanduser().resolve(), Path(args.experts).expanduser().resolve())
             return merge(args)
-        return bake(args)
+        import torch  # LNA-LAB: the converter runs under inference_mode; loaded tensors are inference tensors
+        with torch.inference_mode():
+            return bake(args)
     except (RuntimeError, ValueError, OSError) as exc:
         log(f"ERROR {exc}")
         return 2
