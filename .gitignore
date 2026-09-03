@@ -3,3 +3,4 @@ vllm-exl3/
 recipe/
 *.log
 prof/
+tools/__pycache__/
