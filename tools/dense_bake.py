@@ -885,8 +885,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devices", default="0,1", help="CUDA device IDs, e.g. 0,1")
     parser.add_argument("--resume", action="store_true", help="resume completed module checkpoints")
     parser.add_argument("--dry-run", action="store_true", help="offline layout/merge planning; no writes")
-    parser.add_argument("--vllm-root", default="model", help="vLLM model root prefix")
-    parser.add_argument("--vllm-shared-prefix", default="mlp.shared_experts",
+    parser.add_argument("--vllm-root", default="language_model.model", help="vLLM model root prefix (LNA-LAB: vision class roots the text model under language_model.model)")
+    parser.add_argument("--vllm-shared-prefix", default="ffn.shared_experts",
                         help="vLLM shared-expert child prefix under model.layers.N")
     parser.add_argument("--verbose", action="store_true")
     return parser
