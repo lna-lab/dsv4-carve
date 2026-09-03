@@ -443,7 +443,8 @@ def expected_mtp_meta(
     """
     del draft_shapes
     if suffix == "mcg":
-        return {"dtype": EXL3_DTYPE[suffix], "shape": []}
+        # Lna-Lab: donor markers are scalar; the vLLM destination parameter is [1].
+        return {"dtype": EXL3_DTYPE[suffix], "shape": [1]}
     reference = main_shapes[projection][suffix]
     return {"dtype": reference["dtype"], "shape": list(reference["shape"])}
 
@@ -504,6 +505,8 @@ def validate_and_plan_donor(
             if donor_name not in header:
                 raise RuntimeError(f"donor header lacks indexed tensor {donor_name}")
             actual = copy.deepcopy(header[donor_name])
+            if donor_name.endswith(".mcg") and actual.get("shape") == []:
+                actual["shape"] = [1]  # same 4 bytes; vLLM wants a (1,) parameter
             # Dtype and shape must agree with the concrete main K2 EXL3 ABI.
             # The source MTP FP8 tensors are TP-local; the donor EXL3 tensors
             # are full-width, as the local donor shard header confirms.
