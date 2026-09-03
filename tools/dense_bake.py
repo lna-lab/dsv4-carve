@@ -97,7 +97,7 @@ def _schema_bits(value: float) -> int:
 
 
 def _layer_number(key: str) -> int:
-    match = re.match(r"^layers\.([0-9]+)\.", key)
+    match = re.match(r"^layers\.([0-9]+)(?:\.|$)", key)  # LNA-LAB: module keys are bare "layers.N"
     if match is None:
         raise ValueError(f"not a language-layer key: {key}")
     return int(match.group(1))
