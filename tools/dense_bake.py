@@ -86,8 +86,9 @@ def bits_for_key(key: str, bits: float, attn_bits: float | None, shared_bits: fl
     kind = dense_kind(key)
     if kind is None:
         raise ValueError(f"not a T4 dense key: {key}")
-    return float(attn_bits if kind == "attn" and attn_bits is not None else
-                 shared_bits if kind == "shared" and shared_bits is not None else bits)
+    value = float(attn_bits if kind == "attn" and attn_bits is not None else
+                  shared_bits if kind == "shared" and shared_bits is not None else bits)
+    return int(value) if value.is_integer() else value  # LNA-LAB: the quantizer shifts by K (must be int)
 
 
 def _schema_bits(value: float) -> int:
