@@ -790,6 +790,10 @@ def verify_output(
     for filename in rewrite_files:
         if (out / filename).is_symlink():
             raise RuntimeError(f"rewritten source shard is still a symlink: {filename}")
+        _, rewritten_header = read_header(out / filename)
+        leftover = [n for n in rewritten_header if n != "__metadata__" and n in dropped]
+        if leftover:
+            raise RuntimeError(f"rewritten shard {filename} still carries {len(leftover)} dropped tensors, e.g. {leftover[0]}")
 
     for name, (source_path, source_header_len, source_header) in source.items():
         if name in dropped:
@@ -910,7 +914,7 @@ def build(args: argparse.Namespace) -> int:
         raise RuntimeError("donor headers were not loaded for a real build")
     write_new_shard(out, plan, donor, layers, donor_headers)
     for filename in sorted(rewrite_files):
-        rewrite_source_shard(src / filename, out / filename, dropped_by_file[filename])
+        rewrite_source_shard(src / filename, out / filename, {n for n, _ in dropped_by_file[filename]})
     write_output_metadata(out, expected_index, expected_config)
     log(f"BUILD_OK out={out}")
     if args.verify:
