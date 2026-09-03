@@ -793,8 +793,10 @@ def verify_output(
 
     for name, (source_path, source_header_len, source_header) in source.items():
         if name in dropped:
-            if name in actual_index["weight_map"]:
-                raise RuntimeError(f"dropped source tensor remains indexed: {name}")
+            # Replaced in place: the same name must now point at the new K2 shard.
+            where = actual_index["weight_map"].get(name)
+            if where is not None and where != NEW_SHARD:
+                raise RuntimeError(f"dropped source tensor remains indexed in {where}: {name}")
             continue
         if source_path.name not in rewrite_files:
             continue
