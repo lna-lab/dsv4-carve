@@ -4,7 +4,7 @@ Lna-Lab's serving recipe for [vcruz305/DSV4-Flash-Vision-EXL3-MixedK](https://hu
 carved down until a **380K-context, 4-stream, speculative (DSpark3) seat** fits on eight RTX PRO 2000 (16 GB, Blackwell sm_120)
 under vLLM. Adopted as the house model of SAZANAMI on 2026-09-03 ("オオタニ").
 
-Weights (private mirror, 86 GB): `sakamakismile/DSV4-Flash-Vision-EXL3-MixedK-D2-K2x3-Dense6`.
+Weights (86 GB): `sakamakismile/DSV4-Flash-Vision-EXL3-MixedK-D2-K2x3-Dense6`.
 
 ## What is in the pack
 
