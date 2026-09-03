@@ -513,8 +513,8 @@ def bake(args: argparse.Namespace) -> int:
         if any(m.qmap is None for m in targets):
             raise RuntimeError(f"{module.key}: a dense target has no Hessian qmap")
         keys = [m.key for m in targets]
-        if keys != dense_keys_for_layer(layer, keys):
-            raise RuntimeError(f"{module.key}: dense target ordering/filter changed after load")
+        if sorted(keys) != sorted(dense_keys_for_layer(layer, keys)):  # LNA-LAB: module order is not lexical
+            raise RuntimeError(f"{module.key}: dense target ordering/filter changed after load; got={keys} expected={dense_keys_for_layer(layer, keys)}")
 
         capture_replicas = None
         if parallel:
@@ -665,8 +665,12 @@ def _config_with_vllm_block(base_config: dict, work_items: list[dict], args) -> 
         base = item["base"]
         tail = base.split(".", 2)[2]
         if _WO_A_RE.fullmatch(tail):
-            continue  # Explicitly unresolved; see README and config wo_a note.
-        vllm = _vllm_prefixes(_layer_number(base), args.vllm_root, args.vllm_shared_prefix).get(tail)
+            # LNA-LAB: the plugin consumes one already-sliced wo_a per TP rank.
+            vllm = f"{args.vllm_root}.layers.{_layer_number(base)}.attn.wo_a"
+        else:
+            vllm = _vllm_prefixes(
+                _layer_number(base), args.vllm_root, args.vllm_shared_prefix
+            ).get(tail)
         if vllm is None:
             raise RuntimeError(f"no vLLM prefix mapping for {base}")
         bits = args.attn_bits if dense_kind(base) == "attn" and args.attn_bits is not None else \
@@ -675,14 +679,11 @@ def _config_with_vllm_block(base_config: dict, work_items: list[dict], args) -> 
         old = layers.setdefault(vllm, {"bits": bits})
         if old["bits"] != bits:
             raise RuntimeError(f"fused vLLM module has mixed bits: {vllm}")
+    # LNA-LAB: unmatched dense modules (notably indexer.weights_proj) stay BF16.
+    q.setdefault("non_routed_dtype_policy", "bf16_as_stored")
     q["non_routed_exl3"] = {
         "codebook": "mcg",
         "layers": dict(sorted(layers.items())),
-        "wo_a": {
-            "status": "unresolved",
-            "source": "layers.N.attn.wo_a.slice.0..7",
-            "question": "Can the vLLM DSV4 o_groups einsum consume EXL3 wo_a shards?",
-        },
     }
     return config
 
