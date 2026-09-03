@@ -851,6 +851,16 @@ def _verify_merge(experts: Path, out: Path, plan: dict[str, Any]) -> None:
 
 def merge(args: argparse.Namespace) -> int:
     work = Path(args.work).expanduser().resolve()
+    # LNA-LAB: the merged config must describe the bits that were actually baked.
+    # Unless --bits was given explicitly, take bits/attn_bits/shared_bits from work/args.json.
+    if not getattr(args, "_bits_explicit", False):
+        recorded = work / "args.json"
+        if recorded.is_file():
+            rec = json.loads(recorded.read_text())
+            args.bits = rec.get("bits", args.bits)
+            args.attn_bits = rec.get("attn_bits", args.attn_bits)
+            args.shared_bits = rec.get("shared_bits", args.shared_bits)
+            log(f"MERGE_BITS from {recorded}: bits={args.bits:g} attn_bits={args.attn_bits} shared_bits={args.shared_bits}")
     experts = Path(args.experts).expanduser().resolve()
     out = Path(args.merge).expanduser().resolve()
     overlay.safe_output_path(experts, out)
@@ -894,6 +904,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = make_parser().parse_args(argv)
+    args._bits_explicit = any(a == "--bits" or a.startswith("--bits=") for a in (argv if argv is not None else sys.argv[1:]))
     try:
         if args.merge:
             # A merge is independent of CUDA; --dry-run additionally performs
