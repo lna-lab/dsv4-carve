@@ -255,6 +255,9 @@ def donor_headers_from_remote(
     weight_map: dict[str, str],
     selected_names: Iterable[str],
     cache_path: Path | None,
+    *,
+    write_cache: bool = True,
+    allow_network: bool = True,
 ) -> dict[str, tuple[int, dict]]:
     """Read one remote safetensors header per selected donor shard."""
     base = donor.rstrip("/") if donor.startswith("http") else f"https://huggingface.co/{donor}/resolve/main"
@@ -275,6 +278,8 @@ def donor_headers_from_remote(
             result[filename] = (header_len, header)
             log(f"DONOR_HEADER cache file={filename} tensors={len(header) - 1}")
             continue
+        if not allow_network:
+            raise RuntimeError(f"donor header cache has no entry for {filename}")
         url = f"{base}/{filename}"
         length_blob = http_bytes(url, (0, 7))
         if len(length_blob) != 8:
@@ -288,7 +293,7 @@ def donor_headers_from_remote(
         result[filename] = (header_len, header)
         log(f"DONOR_HEADER remote file={filename} tensors={len(header) - 1}")
 
-    if cache_path is not None:
+    if cache_path is not None and write_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(
             json.dumps(
@@ -410,23 +415,20 @@ def expected_mtp_meta(
     draft_shapes: dict[str, tuple[int, int]],
     main_shapes: dict[str, dict[str, dict]],
 ) -> dict:
-    """Build the offline expected MTP ABI from local draft dimensions and K2."""
-    out_dim, in_dim = draft_shapes[projection]
-    if suffix == "trellis":
-        # Exl3MoEMethod stores gate/up as [in_tiles, out_tiles, K*16] and
-        # down as [out_tiles, in_tiles, K*16].  MTP source weights are the
-        # local draft dimensions, not the 43-layer main dimensions.
-        if projection in ("w1", "w3"):
-            shape = [in_dim // 16, out_dim // 16, main_shapes[projection][suffix]["shape"][-1]]
-        else:
-            shape = [out_dim // 16, in_dim // 16, main_shapes[projection][suffix]["shape"][-1]]
-    elif suffix == "suh":
-        shape = [in_dim]
-    elif suffix == "svh":
-        shape = [out_dim]
-    else:
-        shape = [1]
-    return {"dtype": EXL3_DTYPE[suffix], "shape": shape}
+    """Build the offline expected MTP ABI from the concrete main K2 ABI.
+
+    The source FP8 MTP weights are TP-local (w1/w3 [2048, 2048], w2
+    [4096, 1024]), while the donor EXL3 tensors are full-width and match the
+    main-layer K2 tensors.  ``draft_shapes`` is still passed here so the
+    source dimensions remain part of the validated plan and cannot silently
+    disappear from the offline check.  EXL3 donor MCG markers are scalar
+    tensors (shape []) although the vLLM destination parameter is [1].
+    """
+    del draft_shapes
+    if suffix == "mcg":
+        return {"dtype": EXL3_DTYPE[suffix], "shape": []}
+    reference = main_shapes[projection][suffix]
+    return {"dtype": reference["dtype"], "shape": list(reference["shape"])}
 
 
 def validate_donor_selection(
@@ -485,8 +487,9 @@ def validate_and_plan_donor(
             if donor_name not in header:
                 raise RuntimeError(f"donor header lacks indexed tensor {donor_name}")
             actual = copy.deepcopy(header[donor_name])
-            # Dtype and K must agree with the concrete main K2 EXL3 ABI.  The
-            # draft's dimensions are intentionally used for MTP shape checking.
+            # Dtype and shape must agree with the concrete main K2 EXL3 ABI.
+            # The source MTP FP8 tensors are TP-local; the donor EXL3 tensors
+            # are full-width, as the local donor shard header confirms.
             if actual.get("dtype") != expected["dtype"] or actual.get("shape") != expected["shape"]:
                 raise RuntimeError(
                     f"donor shape/dtype mismatch for {donor_name}: got "
@@ -922,7 +925,14 @@ def build(args: argparse.Namespace) -> int:
     donor_headers: dict[str, tuple[int, dict]] | None = None
     if args.dry_run:
         if cache_path is not None and cache_path.exists():
-            donor_headers = donor_headers_from_remote(donor, donor_map, selected, cache_path)
+            donor_headers = donor_headers_from_remote(
+                donor,
+                donor_map,
+                selected,
+                cache_path,
+                write_cache=False,
+                allow_network=False,
+            )
         else:
             log("DONOR_HEADERS offline=not-read; dry-run uses local MTP dimensions")
     else:
