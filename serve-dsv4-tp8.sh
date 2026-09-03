@@ -1,0 +1,20 @@
+#!/bin/bash
+# DSV4-Flash-Vision EXL3 MixedK on 8 experiment GPUs (TP=8) via lna-lab/vllm-exl3:dsv4. YUKI 2026-09-03
+# env: GPUS (default 0,1,2,3,5,7,8,9) PORT(8899) MAXLEN(65536) SPEC ('' or json) UTIL(0.90) NAME(dsv4)
+set -u
+GPUS=${GPUS:-0,1,2,3,5,7,8,9}; PORT=${PORT:-8899}; MAXLEN=${MAXLEN:-65536}; UTIL=${UTIL:-0.90}; NAME=${NAME:-dsv4}
+TP=$(echo $GPUS | tr ',' '\n' | wc -l)
+M=/run/media/tonoken3/DATA1/DSV4-Flash-Vision-EXL3-MixedK
+EXTRA=()
+[[ -n "${SPEC:-}" ]] && EXTRA+=(--speculative-config "$SPEC")
+docker rm -f $NAME >/dev/null 2>&1
+docker run -d --name $NAME --gpus "\"device=$GPUS\"" --shm-size=16g --ipc=host \
+  -e NCCL_P2P_DISABLE=1 -e NCCL_CUMEM_ENABLE=0 ${NCCL_EXTRA:-} -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
+  -p 127.0.0.1:$PORT:8000 -v $M:$M -v /run/media/tonoken3/DATA1/vllm-exl3-lab:/lab \
+  lna-lab/vllm-exl3:dsv4 \
+  $M --served-model-name DSV4-Flash --tensor-parallel-size $TP --quantization exl3 \
+  --max-model-len $MAXLEN --max-num-seqs ${SEQS:-4} --max-num-batched-tokens ${BT:-2048} \
+  --kv-cache-dtype fp8 --gpu-memory-utilization $UTIL ${EAGER:+--enforce-eager} --compilation-config "${COMPILE:-{\"cudagraph_capture_sizes\":[1,2,4]\}}" --disable-custom-all-reduce \
+  --no-enable-prefix-caching --trust-remote-code \
+  --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 "${EXTRA[@]}"
+echo "container $NAME on :$PORT (TP=$TP, spec=${SPEC:-off}); docker logs -f $NAME"
