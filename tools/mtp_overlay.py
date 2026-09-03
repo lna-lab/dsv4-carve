@@ -880,7 +880,7 @@ def verify_output(
     # New names, shapes, dtypes and MCG markers must match the donor plan.
     for item in plan:
         path, header_len, header = output_headers[item["target"]]
-        del path, header_len
+        del path
         actual = header[item["target"]]
         if actual["dtype"] != item["meta"]["dtype"] or actual["shape"] != item["meta"]["shape"]:
             raise RuntimeError(f"new tensor metadata differs from donor plan: {item['target']}")
