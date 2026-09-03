@@ -4,13 +4,13 @@
 set -u
 GPUS=${GPUS:-0,1,2,3,5,7,8,9}; PORT=${PORT:-8899}; MAXLEN=${MAXLEN:-65536}; UTIL=${UTIL:-0.90}; NAME=${NAME:-dsv4}
 TP=$(echo $GPUS | tr ',' '\n' | wc -l)
-M=/run/media/tonoken3/DATA1/DSV4-Flash-Vision-EXL3-MixedK
+M=${MODEL:-/run/media/tonoken3/DATA1/DSV4-Flash-Vision-EXL3-MixedK}
 EXTRA=()
 [[ -n "${SPEC:-}" ]] && EXTRA+=(--speculative-config "$SPEC")
 docker rm -f $NAME >/dev/null 2>&1
 docker run -d --name $NAME --gpus "\"device=$GPUS\"" --shm-size=16g --ipc=host \
   -e NCCL_P2P_DISABLE=1 -e NCCL_CUMEM_ENABLE=0 ${NCCL_EXTRA:-} -e VLLM_NO_USAGE_STATS=1 -e DO_NOT_TRACK=1 \
-  -p 127.0.0.1:$PORT:8000 -v $M:$M -v /run/media/tonoken3/DATA1/vllm-exl3-lab:/lab \
+  -p 127.0.0.1:$PORT:8000 -v $M:$M -v /run/media/tonoken3/DATA1/DSV4-Flash-Vision-EXL3-MixedK:/run/media/tonoken3/DATA1/DSV4-Flash-Vision-EXL3-MixedK -v /run/media/tonoken3/DATA1/vllm-exl3-lab:/lab \
   lna-lab/vllm-exl3:dsv4 \
   $M --served-model-name DSV4-Flash --tensor-parallel-size $TP --quantization exl3 \
   --max-model-len $MAXLEN --max-num-seqs ${SEQS:-4} --max-num-batched-tokens ${BT:-2048} \

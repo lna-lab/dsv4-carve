@@ -12,7 +12,7 @@ def metrics():
     out = {}
     for k in ("vllm:spec_decode_num_accepted_tokens_total", "vllm:spec_decode_num_drafts_total", "vllm:spec_decode_num_draft_tokens_total"):
         m = re.findall(r"^" + re.escape(k) + r"(?:\{[^}]*\})?\s+([\d.e+]+)", t, re.M)
-        if m: out[k.split("num_")[1]] = sum(float(x) for x in m)
+        if m: out[k.split("num_")[1].replace("_total","")] = sum(float(x) for x in m)
     return out
 for name, prompt in P.items():
     body = {"model": "DSV4-Flash", "messages": [{"role": "user", "content": prompt}], "max_tokens": N, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
