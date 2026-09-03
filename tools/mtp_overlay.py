@@ -226,7 +226,24 @@ def donor_index_from_file(path: Path) -> dict[str, str]:
 
 
 def http_bytes(url: str, byte_range: tuple[int, int] | None = None) -> bytes:
-    """Fetch one complete response, retrying transient/range failures."""
+    """Fetch one complete response, retrying transient/range failures.
+
+    Lna-Lab: if MTP_OVERLAY_LOCAL_DIR holds a file with the URL's basename (a
+    pre-downloaded donor shard), serve the bytes from it instead of the network.
+    """
+    local_dir = os.environ.get("MTP_OVERLAY_LOCAL_DIR")
+    if local_dir:
+        local_path = Path(local_dir) / url.rsplit("/", 1)[-1].split("?")[0]
+        if local_path.is_file():
+            with local_path.open("rb") as fh:
+                if byte_range is None:
+                    return fh.read()
+                fh.seek(byte_range[0])
+                data = fh.read(byte_range[1] - byte_range[0] + 1)
+            expected = byte_range[1] - byte_range[0] + 1
+            if len(data) != expected:
+                raise RuntimeError(f"short local range read {local_path}: got {len(data)}, expected {expected}")
+            return data
     for attempt in range(RETRY_COUNT):
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "mtp_overlay/1"})
