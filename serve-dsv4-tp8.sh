@@ -15,6 +15,6 @@ docker run --ulimit core=0 --cap-add=SYS_PTRACE -e VLLM_DISABLE_SHARED_EXPERTS_S
   $M --served-model-name DSV4-Flash --tensor-parallel-size $TP --quantization exl3 \
   --max-model-len $MAXLEN --max-num-seqs ${SEQS:-4} --max-num-batched-tokens ${BT:-2048} \
   --kv-cache-dtype ${KVDT:-fp8} --gpu-memory-utilization $UTIL ${EAGER:+--enforce-eager} --compilation-config "${COMPILE:-{\"cudagraph_capture_sizes\":[1,2,4]\}}" --disable-custom-all-reduce \
-  --no-enable-prefix-caching --trust-remote-code ${PROFILE:+--profiler-config "$PROFILE"} \
+  ${APC_OFF:+--no-enable-prefix-caching} --trust-remote-code ${PROFILE:+--profiler-config "$PROFILE"} \
   --enable-auto-tool-choice --tool-call-parser deepseek_v4 --reasoning-parser deepseek_v4 "${EXTRA[@]}"
 echo "container $NAME on :$PORT (TP=$TP, spec=${SPEC:-off}); docker logs -f $NAME"
