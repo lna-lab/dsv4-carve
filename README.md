@@ -35,6 +35,23 @@ Per-GPU (TP8): weights 12.0 GiB, KV pool **396,656 tokens** at `--max-model-len 
 2. **exllamav3's cooperative-GEMM autotuner runs inside CUDA-graph capture** (`coop_autotune.cu:464`, "operation not permitted when stream is capturing"). Patch in `recipe-lna/exllamav3/exl3_gemm.cu.lna`: skip tuning while `cudaStreamIsCapturing`, fall back to the static heuristic; plus the plugin pre-tunes decode row counts (1,2,4,8,16) right after weight load (`LNA_EXL3_PREWARM_ROWS`).
 3. **Decode deadlock, GPU 100 % on all ranks.** vLLM's FusedMoE overlaps *shared experts on a second stream* for ≤ 256 tokens. With shared experts also EXL3, two cooperative kernels share exllamav3's per-device lock buffer (`DevCtx::get_locks`) from two streams and spin forever. Diagnosed with `CUDA_LAUNCH_BLOCKING=1` (no hang → concurrency) and py-spy. Fix: **`VLLM_DISABLE_SHARED_EXPERTS_STREAM=1`** (default in `serve-dsv4-tp8.sh`).
 
+## 2026-09-04 — house kernel **lna2** (routed experts), adopted by Ken
+
+The routed-experts decode kernel was replaced by a bespoke one (`recipe-lna/lna2/`, the "Ferrari" doctrine: one kernel for one model on one machine).
+Resident expert teams + dynamic tickets (no grid-wide barrier) outside, small-R inner loops (rows per expert 1–8) inside.
+
+| | exllamav3 `exl3_moe` | **lna2** |
+|---|---|---|
+| routed kernel, per launch | 232.6 µs | **104.0 µs** (2.24×) |
+| single stream code / en / ja | 86 / 60 / 56 tok/s | **108.6 / 78.6 / 71.1** |
+| 4 streams code / en / ja | 125–179 / 96 / 83 | 193.8 / 146.4 / 129.0 |
+| KV window @ util 0.97 | 396,656 tok | 395,069 |
+| needle @166k | found, TTFT 167 s | found, **119.6 s** |
+| ppl (wikitext, 4k, spec off, matched) | 4.7630 | 4.7647 |
+
+Launch: as above plus `NATIVE_SO=recipe-lna/lna2/vllm_exl3_c.cpython-312-x86_64-linux-gnu.so MOE_KERNEL=lna2` and `-e VLLM_EXL3_MOE_STRICT=1` (fail loudly instead of silently falling back — the first delivery of this kernel *did* silently fall back and "passed" its gates; the seat log must show `LNA2 MoE kernel ACTIVE` on every rank).
+Not adopted: the dense-linear launch fusion (`LNA_EXL3_DENSE_GROUP`, T0 passed its gate at 1.21× on the dense segment but T1 is still being fixed) and the first barrier-based attempt (`lna`, correct but not faster). Full story, gates and reviews: `orders/reports/`, canon `docs/LNA-CANON.md`.
+
 ## Serving
 
 Image: `Dockerfile` (vllm/vllm-openai:nightly + vLLM 0.28.1rc1.dev337 wheel + exllamav3 1.4.5 built from source with the house patches + vllm-exl3 0.2.3 + `recipe-lna/patch_*.py`). The rebuilt extension and plugin are mounted over the image at run time (`EXT_SO`, `PLUGIN_SRC`) so the image never needs re-baking.

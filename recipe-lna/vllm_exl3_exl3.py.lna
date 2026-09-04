@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import weakref
 from typing import TYPE_CHECKING, Any
 
 import re
@@ -57,6 +58,748 @@ TEMP_ROWS_FUSED = 2048
 MOE_ACT_SILU = 0
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+# ---------------------------------------------------------------------------
+# LNA-LAB: dense shard/fan fusion (F2 T0/T1).
+#
+# Mode 1 is the T0, stateless same-call shard fusion.  Mode 2 retains that
+# path and adds load-time registered, layer-local fans.  The fans are the
+# safe lazy form from F2 §3.3: a first member call owns one generation and
+# computes every member; later members only return that generation's
+# persistent output slice.  No CUDA allocation or pointer-table construction
+# is permitted in the hot path.
+# ---------------------------------------------------------------------------
+_DENSE_GROUP_SCRATCH: dict[tuple, tuple] = {}
+_DENSE_GROUP_SHARED_SCRATCH: dict[tuple, dict[str, Any]] = {}
+_DENSE_GROUP_REGISTRY: dict[str, dict[str, weakref.ReferenceType]] = {}
+_DENSE_GROUP_FALLBACK_COUNTS: dict[str, int] = {}
+_DENSE_GROUP_STATS: dict[str, int] = {
+    "t0_active": 0,
+    "t1_active": 0,
+    "fallback_total": 0,
+    "prewarm_groups": 0,
+}
+_DENSE_GROUP_ACTIVE_LOGGED: set[str] = set()
+_DENSE_GROUP_MODE_ACTIVE_LOGGED: set[int] = set()
+_DENSE_GROUP_CALL_COUNTS: dict[int, int] = {1: 0, 2: 0}
+_DENSE_GROUP_PREWARMED: set[tuple] = set()
+_DENSE_GROUP_FIRST_CALL_TRACED: set[str] = set()
+_DENSE_GROUP_POOL_MAX_MATRICES = 8
+_DENSE_GROUP_POOL_MAX_K = 4096
+_DENSE_GROUP_POOL_MAX_OUTPUT = 32768
+
+
+def _dense_vram_mark(device: torch.device | None) -> int | None:
+    """Return an allocation counter only for the opt-in relay VRAM trace."""
+    if os.environ.get("LNA_EXL3_VRAM_TRACE") != "1" or device is None:
+        return None
+    if device.type != "cuda":
+        return None
+    torch.cuda.synchronize(device)
+    return int(torch.cuda.memory_allocated(device))
+
+
+def _dense_vram_report(
+    phase: str,
+    group_id: str,
+    before: int | None,
+    after: int | None,
+) -> None:
+    if before is None or after is None:
+        return
+    delta = after - before
+    logger.info(
+        "F2 VRAM phase=%s layer=%s before_mib=%.3f after_mib=%.3f delta_mib=%+.3f",
+        phase,
+        group_id,
+        before / (1024 * 1024),
+        after / (1024 * 1024),
+        delta / (1024 * 1024),
+    )
+
+
+def dense_group_mode() -> int:
+    """Return 0 (OFF), 1 (T0), or 2 (T1); malformed values fail closed."""
+    raw = os.environ.get("LNA_EXL3_DENSE_GROUP", "0")
+    try:
+        mode = int(raw)
+    except (TypeError, ValueError):
+        mode = 0
+        _dense_group_fallback("config", f"invalid LNA_EXL3_DENSE_GROUP={raw!r}")
+    if mode not in (0, 1, 2):
+        _dense_group_fallback("config", f"unsupported LNA_EXL3_DENSE_GROUP={raw!r}")
+        return 0
+    return mode
+
+
+def dense_group_enabled() -> bool:
+    return dense_group_mode() != 0
+
+
+def _dense_group_fallback(reason: str, detail: str, group_id: str | None = None) -> None:
+    key = f"{reason}:{group_id or '*'}"
+    count = _DENSE_GROUP_FALLBACK_COUNTS.get(key, 0) + 1
+    _DENSE_GROUP_FALLBACK_COUNTS[key] = count
+    _DENSE_GROUP_STATS["fallback_total"] += 1
+    # Every declined fused call is intentionally logged.  A once-per-reason
+    # warning can hide a mounted-tree or intermittent stream problem on a seat.
+    logger.warning(
+        "F2 DENSE_GROUP declined: %s: %s (group=%s count=%d)",
+        reason,
+        detail,
+        group_id or "?",
+        count,
+    )
+
+
+def _dense_group_active(mode: int, group_id: str) -> None:
+    stat = "t1_active" if mode == 2 else "t0_active"
+    label = "T1" if mode == 2 else "T0"
+    _DENSE_GROUP_STATS[stat] += 1
+    _DENSE_GROUP_CALL_COUNTS[mode] = _DENSE_GROUP_CALL_COUNTS.get(mode, 0) + 1
+    if mode not in _DENSE_GROUP_MODE_ACTIVE_LOGGED:
+        _DENSE_GROUP_MODE_ACTIVE_LOGGED.add(mode)
+        logger.info("F2 DENSE_GROUP=%d ACTIVE", mode)
+    if group_id not in _DENSE_GROUP_ACTIVE_LOGGED:
+        _DENSE_GROUP_ACTIVE_LOGGED.add(group_id)
+        logger.info(
+            "EXL3 dense group ACTIVE mode=%s group=%s (first trigger)",
+            label,
+            group_id,
+        )
+
+
+def dense_group_stats() -> dict[str, Any]:
+    """Return counters for gates; intentionally has no CUDA-side effects."""
+    return {
+        **_DENSE_GROUP_STATS,
+        "fallbacks": dict(_DENSE_GROUP_FALLBACK_COUNTS),
+        "active_groups": sorted(_DENSE_GROUP_ACTIVE_LOGGED),
+        "call_counts": dense_group_call_counts(),
+    }
+
+
+def dense_group_call_counts() -> dict[int, int]:
+    """Return successful fused-call counts for T0 (1) and T1 (2)."""
+    return dict(_DENSE_GROUP_CALL_COUNTS)
+
+
+def reset_dense_group_state() -> None:
+    """Test-only reset for registry, scratch, generations, and observability."""
+    for entries in _DENSE_GROUP_REGISTRY.values():
+        for ref in entries.values():
+            module = ref()
+            if module is not None:
+                module._exl3_dense_fan = None
+    _DENSE_GROUP_REGISTRY.clear()
+    _DENSE_GROUP_SCRATCH.clear()
+    _DENSE_GROUP_SHARED_SCRATCH.clear()
+    _DENSE_GROUP_FALLBACK_COUNTS.clear()
+    _DENSE_GROUP_ACTIVE_LOGGED.clear()
+    _DENSE_GROUP_MODE_ACTIVE_LOGGED.clear()
+    _DENSE_GROUP_PREWARMED.clear()
+    _DENSE_GROUP_FIRST_CALL_TRACED.clear()
+    for mode in _DENSE_GROUP_CALL_COUNTS:
+        _DENSE_GROUP_CALL_COUNTS[mode] = 0
+    for key in _DENSE_GROUP_STATS:
+        _DENSE_GROUP_STATS[key] = 0
+
+
+def _dense_group_tables(linears: list, group_id: str) -> dict:
+    """Build immutable device pointer tables after load-time validation."""
+    assert linears, "empty EXL3 group"
+    assert all(lin.quant_type == "exl3" for lin in linears), "non-EXL3 member"
+    assert all(lin.bias is None for lin in linears), "mgemm never applies bias"
+    fmts = {(int(lin.K), bool(lin.mcg), bool(lin.mul1)) for lin in linears}
+    assert len(fmts) == 1, f"K/mcg/mul1 must be uniform, got {fmts}"
+    in_features = int(linears[0].in_features)
+    assert all(int(lin.in_features) == in_features for lin in linears), "k must be uniform"
+    ns = [int(lin.out_features) for lin in linears]
+    assert ns[0] == max(ns), f"first member must be widest, ns={ns}"
+    assert all(n % 128 == 0 for n in ns), f"mgemm needs n % 128 == 0, ns={ns}"
+    assert in_features % 16 == 0, f"mgemm needs k % 16 == 0, k={in_features}"
+    assert len(ns) <= _DENSE_GROUP_POOL_MAX_MATRICES, "dense group exceeds shared matrix capacity"
+    assert sum(ns) <= _DENSE_GROUP_POOL_MAX_OUTPUT, "dense group exceeds shared output capacity"
+    device = linears[0].trellis.device
+    # exl3_mgemm consumes size_n_list/c_ptrs and walks each matrix with its
+    # own N.  Keep the loaded trellis and svh pointers directly; making
+    # max-width zero-scaled carriers here duplicated most of the model.
+    kernel_ns = ns
+    return {
+        "group_id": group_id,
+        "trellis": torch.tensor(
+            [int(lin.trellis.data_ptr()) for lin in linears],
+            dtype=torch.int64,
+            device=device,
+        ),
+        "suh": torch.tensor(
+            [int(lin.suh.data_ptr()) for lin in linears], dtype=torch.int64, device=device
+        ),
+        "svh": torch.tensor(
+            [int(lin.svh.data_ptr()) for lin in linears], dtype=torch.int64, device=device
+        ),
+        "n": torch.tensor(kernel_ns, dtype=torch.int32, device=device),
+        "idx": torch.arange(len(linears), dtype=torch.int64, device=device).unsqueeze(0),
+        "ns": ns,
+        "kernel_ns": kernel_ns,
+        "weight_keepalive": (),
+        "K": int(linears[0].K),
+        "mcg": bool(linears[0].mcg),
+        "mul1": bool(linears[0].mul1),
+        "k": in_features,
+    }
+
+
+def _dense_group_tables_for_call(linears: list, group_id: str) -> dict:
+    """Build one call descriptor, splitting mixed-N members for old kernels."""
+    group = _dense_group_tables(linears, group_id)
+    if len(set(group["ns"])) == 1:
+        return group
+    subgroups = []
+    output_base = 0
+    by_width: dict[int, list[int]] = {}
+    for index, width in enumerate(group["ns"]):
+        by_width.setdefault(width, []).append(index)
+    for width, indices in by_width.items():
+        subgroup = _dense_group_tables(
+            [linears[index] for index in indices],
+            f"{group_id}:n{width}",
+        )
+        subgroup["output_base"] = output_base
+        subgroup["member_indices"] = tuple(indices)
+        subgroups.append(subgroup)
+        output_base += sum(subgroup["ns"])
+    group["subgroups"] = tuple(subgroups)
+    return group
+
+
+def _dense_group_shared_pool(
+    group: dict, dtype: torch.dtype, *, allocate: bool = False
+) -> dict[str, Any] | None:
+    """Return one device-wide scratch pool sized for all production groups."""
+    device = group["trellis"].device
+    key = (str(device), dtype)
+    pool = _DENSE_GROUP_SHARED_SCRATCH.get(key)
+    n_mat = len(group.get("kernel_ns", group["ns"]))
+    max_rows = 16
+    need_ahad = max_rows * n_mat * int(group["k"])
+    need_out = max_rows * sum(int(n) for n in group["ns"])
+    if pool is None:
+        if not allocate:
+            return None
+        # Production has at most eight local matrices and 32,768 output
+        # columns in one group.  Reserve the full decode capacity once so a
+        # later layer cannot grow the pool and strand earlier graph pointers.
+        need_ahad = max(need_ahad, 16 * _DENSE_GROUP_POOL_MAX_MATRICES * max(
+            int(group["k"]), _DENSE_GROUP_POOL_MAX_K
+        ))
+        need_out = max(need_out, 16 * _DENSE_GROUP_POOL_MAX_OUTPUT)
+        pool = {
+            "ahad": torch.empty((need_ahad,), dtype=torch.float16, device=device),
+            "out": torch.empty((need_out,), dtype=dtype, device=device),
+            "owner": None,
+        }
+        _DENSE_GROUP_SHARED_SCRATCH[key] = pool
+    elif pool["ahad"].numel() < need_ahad or pool["out"].numel() < need_out:
+        raise RuntimeError(
+            f"dense group exceeds shared pool capacity: matrices={n_mat} "
+            f"k={group['k']} outputs={sum(int(n) for n in group['ns'])}"
+        )
+    return pool
+
+
+def _dense_group_scratch(
+    group: dict, m: int, dtype: torch.dtype, *, allocate: bool = False
+) -> tuple | None:
+    """Return views into the one preallocated device pool; never hot-allocate."""
+    device = group["trellis"].device
+    key = (group["group_id"], str(device), tuple(group["ns"]), m, group["k"], dtype)
+    ent = _DENSE_GROUP_SCRATCH.get(key)
+    if ent is None and allocate:
+        ns = group.get("kernel_ns", group["ns"])
+        n_mat = len(ns)
+        pool = _dense_group_shared_pool(group, dtype, allocate=True)
+        assert pool is not None
+        ahad = pool["ahad"][: n_mat * m * group["k"]].view(n_mat, m, group["k"])
+        outs_list = []
+        offset = int(group.get("output_base", 0)) * m
+        for n in ns:
+            size = m * n
+            outs_list.append(pool["out"][offset : offset + size].view(m, n))
+            offset += size
+        outs = tuple(outs_list)
+        cptr = torch.tensor([o.data_ptr() for o in outs], dtype=torch.int64, device=device)
+        ent = (ahad, outs, cptr)
+        _DENSE_GROUP_SCRATCH[key] = ent
+    return ent
+
+
+def _prepare_dense_group(group: dict) -> None:
+    """Prepare pointer tables for every decode bucket over shared storage."""
+    _dense_group_shared_pool(group, torch.float32, allocate=True)
+    groups = group.get("subgroups", (group,))
+    for subgroup in groups:
+        for m in range(1, 17):
+            _dense_group_scratch(subgroup, m, torch.float32, allocate=True)
+
+
+def _dense_fan_spec(prefix: str | None) -> tuple[str, str, str] | None:
+    if not prefix:
+        return None
+    suffix = ".fused_wqa_wkv"
+    if prefix.endswith(suffix):
+        return "h", prefix[: -len(suffix)], "qkv"
+    suffix = ".indexer.compressor.fused_wkv_wgate"
+    if prefix.endswith(suffix):
+        return "h", prefix[: -len(suffix)], "indexer_compressor"
+    suffix = ".compressor.fused_wkv_wgate"
+    if prefix.endswith(suffix):
+        return "h", prefix[: -len(suffix)], "compressor"
+    suffix = ".indexer.wq_b"
+    if prefix.endswith(suffix):
+        return "q", prefix[: -len(suffix)], "indexer_qb"
+    suffix = ".wq_b"
+    if prefix.endswith(suffix):
+        return "q", prefix[: -len(suffix)], "qb"
+    return None
+
+
+def _dense_preload_rows() -> tuple[int, ...]:
+    raw = os.environ.get("LNA_EXL3_PREWARM_ROWS", "1,2,4,8,16")
+    rows = []
+    for value in raw.split(","):
+        if not value.strip():
+            continue
+        try:
+            row = int(value)
+        except ValueError:
+            _dense_group_fallback("prewarm", f"invalid row bucket {value!r}")
+            continue
+        if 1 <= row <= 16:
+            rows.append(row)
+        else:
+            _dense_group_fallback("prewarm", f"row bucket {row} outside 1..16")
+    return tuple(dict.fromkeys(rows))
+
+
+def _prewarm_dense_fan(fan: dict) -> None:
+    rows = _dense_preload_rows()
+    if not rows:
+        _dense_group_fallback("prewarm", "no valid row buckets", fan["group_id"])
+        fan["prewarm_failed"] = True
+        return
+    device = fan["trellis"].device
+    if device.type != "cuda":
+        fan["prewarm_failed"] = True
+        _dense_group_fallback("prewarm", f"device={device} is not CUDA", fan["group_id"])
+        return
+    key = (fan["group_id"], tuple(fan["ns"]), rows)
+    if key in _DENSE_GROUP_PREWARMED:
+        return
+    try:
+        owner = next(ref() for ref in fan["member_refs"] if ref() is not None)
+        for row in rows:
+            x = torch.zeros((row, fan["k"]), dtype=torch.float16, device=device)
+            _exl3_group_mgemm(fan, x, torch.float32)
+        _DENSE_GROUP_PREWARMED.add(key)
+        _DENSE_GROUP_STATS["prewarm_groups"] += 1
+        fan["prewarm_failed"] = False
+        del owner
+    except Exception as exc:  # pragma: no cover - hardware/autotuner dependent
+        fan["prewarm_failed"] = True
+        _dense_group_fallback("prewarm", repr(exc), fan["group_id"])
+
+
+def _publish_dense_fan(group_id: str) -> None:
+    entries = _DENSE_GROUP_REGISTRY.get(group_id, {})
+    live = {role: ref() for role, ref in entries.items() if ref() is not None}
+    kind = "q" if group_id.endswith(":qfan") else "h"
+    order = (
+        ("qkv", "compressor", "indexer_compressor")
+        if kind == "h"
+        else ("indexer_qb", "qb")
+    )
+    if kind == "h":
+        if "qkv" not in live:
+            return
+        roles = [role for role in order if role in live]
+        if len(roles) < 2:
+            for module in live.values():
+                module._exl3_dense_fan = None
+            return
+    else:
+        if not all(role in live for role in order):
+            for module in live.values():
+                module._exl3_dense_fan = None
+            return
+        roles = list(order)
+
+    modules = [live[role] for role in roles]
+    flat = []
+    positions: dict[int, tuple[int, ...]] = {}
+    for module in modules:
+        members = [lin for lin in getattr(module, "_exl3_linears", []) if lin is not None]
+        if not members or getattr(module, "_exl3_linear_bf16_shards", []):
+            for member in modules:
+                member._exl3_dense_fan = None
+            return
+        start = len(flat)
+        flat.extend(members)
+        positions[id(module)] = tuple(range(start, len(flat)))
+    if kind == "q":
+        # Replicated indexer.wq_b is wider than TP-local wq_b.  The kernel's
+        # first member must remain the widest so C supplies the max-width
+        # carrier while size_n_list/c_ptrs route each real width.
+        modules = sorted(modules, key=lambda mod: max(int(l.out_features) for l in mod._exl3_linears), reverse=True)
+        flat = []
+        positions = {}
+        for module in modules:
+            start = len(flat)
+            flat.extend(lin for lin in module._exl3_linears if lin is not None)
+            positions[id(module)] = tuple(range(start, len(flat)))
+    if kind == "h" and len(flat) > 6:
+        _dense_group_fallback("registration", f"h-fan has {len(flat)} members (>6)", group_id)
+        return
+    if kind == "q" and len(flat) != 2:
+        _dense_group_fallback("registration", f"q_a-fan has {len(flat)} members (expected 2)", group_id)
+        return
+    device = flat[0].trellis.device
+    tables_before = _dense_vram_mark(device)
+    try:
+        fan = _dense_group_tables_for_call(flat, group_id)
+    except AssertionError as exc:
+        _dense_group_fallback("registration", str(exc), group_id)
+        for module in modules:
+            module._exl3_dense_fan = None
+        return
+    _dense_vram_report("registration.fan_tables", group_id, tables_before, _dense_vram_mark(device))
+    fan.update(
+        {
+            "kind": kind,
+            "member_refs": tuple(weakref.ref(module) for module in modules),
+            "member_ids": frozenset(id(module) for module in modules),
+            "member_positions": positions,
+            "generation": 0,
+            "cache": None,
+            "last_completed": None,
+            "prewarm_failed": False,
+        }
+    )
+    scratch_before = _dense_vram_mark(device)
+    _prepare_dense_group(fan)
+    _dense_vram_report("registration.fan_scratch", group_id, scratch_before, _dense_vram_mark(device))
+    for module in modules:
+        module._exl3_dense_fan = fan
+    if dense_group_mode() == 2:
+        _prewarm_dense_fan(fan)
+
+
+def _register_dense_fan(module: torch.nn.Module) -> None:
+    spec = _dense_fan_spec(getattr(module, "prefix", None))
+    if spec is None:
+        return
+    kind, base, role = spec
+    group_id = f"{base}:{'hfan' if kind == 'h' else 'qfan'}"
+    entries = _DENSE_GROUP_REGISTRY.setdefault(group_id, {})
+    entries[role] = weakref.ref(module)
+    _publish_dense_fan(group_id)
+
+
+def build_exl3_dense_group(module: torch.nn.Module) -> None:
+    """Build the shard-group pointer tables once after load (and before CUDA
+    graph capture). Sentinel values on ``_exl3_dense_group``: missing = not yet
+    checked, None = checked and declined, dict = ready."""
+    if not dense_group_enabled():
+        return
+    if hasattr(module, "_exl3_dense_group"):
+        return
+    linears = [lin for lin in getattr(module, "_exl3_linears", None) or [] if lin is not None]
+    if getattr(module, "_exl3_linear_bf16_shards", []):
+        module._exl3_dense_group = None  # never fused: solo members or mixed bf16
+        return
+    if len(linears) < 2:
+        # A one-shard wq_b is still a T1 q_a-fan member; it has no useful
+        # local T0 table, but its load-time registration must happen now.
+        module._exl3_dense_group = None
+        if dense_group_mode() == 2:
+            _register_dense_fan(module)
+        return
+    try:
+        group_id = f"local:{getattr(module, 'prefix', '?')}:{id(module)}"
+        device = linears[0].trellis.device
+        tables_before = _dense_vram_mark(device)
+        module._exl3_dense_group = _dense_group_tables_for_call(linears, group_id)
+        _dense_vram_report("registration.local_tables", group_id, tables_before, _dense_vram_mark(device))
+        scratch_before = _dense_vram_mark(device)
+        _prepare_dense_group(module._exl3_dense_group)
+        _dense_vram_report("registration.local_scratch", group_id, scratch_before, _dense_vram_mark(device))
+        _register_dense_fan(module)
+    except AssertionError as exc:
+        module._exl3_dense_group = None
+        _dense_group_fallback(
+            "registration",
+            str(exc),
+            f"local:{getattr(module, 'prefix', '?')}:{id(module)}",
+        )
+
+
+def _exl3_group_mgemm(
+    group: dict,
+    x_fp16: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    _trace_first: bool = True,
+) -> list:
+    import exllamav3_ext as ext
+
+    device = x_fp16.device
+    k = int(x_fp16.shape[-1])
+    m = x_fp16.numel() // k
+    ns = group.get("kernel_ns", group["ns"])
+    if out_dtype is not torch.float32:
+        raise RuntimeError(f"T1/T0 C must be fp32, got {out_dtype}")
+    first_call_before = None
+    if _trace_first and group["group_id"] not in _DENSE_GROUP_FIRST_CALL_TRACED:
+        first_call_before = _dense_vram_mark(device)
+    subgroups = group.get("subgroups")
+    if subgroups:
+        outputs = [None] * len(ns)
+        for subgroup in subgroups:
+            subgroup_outputs = _exl3_group_mgemm(
+                subgroup,
+                x_fp16,
+                out_dtype,
+                _trace_first=False,
+            )
+            for index, output in zip(subgroup["member_indices"], subgroup_outputs):
+                outputs[index] = output
+        result = outputs
+    else:
+        scratch = _dense_group_scratch(group, m, out_dtype)
+        if scratch is None:
+            raise RuntimeError(f"preallocated scratch missing for {group['group_id']} m={m}")
+        ahad, outs, cptr = scratch
+        # bszm_in == 1: A is broadcast to every matrix; each matrix keeps its own
+        # suh/svh Hadamard (REVIEW-F1-sol §1.4) and writes its own (m, n_j) output.
+        ext.exl3_mgemm(
+            x_fp16.view(1, m, k),
+            group["trellis"],
+            outs[0].view(1, m, ns[0]),
+            group["suh"],
+            ahad,
+            group["svh"],
+            group["idx"],
+            None,
+            group["K"],
+            -1,
+            group["mcg"],
+            group["mul1"],
+            -1,
+            -1,
+            0,
+            1,
+            group["n"],
+            cptr,
+        )
+        result = list(outs)
+    if first_call_before is not None:
+        _dense_vram_report(
+            "first_call",
+            group["group_id"],
+            first_call_before,
+            _dense_vram_mark(device),
+        )
+        _DENSE_GROUP_FIRST_CALL_TRACED.add(group["group_id"])
+    return result
+
+
+def run_exl3_group(
+    module: torch.nn.Module,
+    x_fp16: torch.Tensor,
+    out_dtype: torch.dtype = torch.float32,
+    *,
+    source_tensor: torch.Tensor | None = None,
+) -> list:
+    """Forward every EXL3 shard of one module call on the same contiguous fp16
+    input. With LNA_EXL3_DENSE_GROUP=1 (T0) or =2 (T1) and the mgemm
+    preconditions met, one exl3_mgemm replaces the per-shard launches; any decline falls back to the
+    exact per-linear forwards used when the flag is off. Returns one output
+    tensor per entry of module._exl3_linears, dtype `out_dtype`."""
+    linears = getattr(module, "_exl3_linears", None) or []
+    solo = lambda: [lin.forward(x_fp16, {}, out_dtype=out_dtype) for lin in linears]
+    mode = dense_group_mode()
+    fan = getattr(module, "_exl3_dense_fan", None) if mode == 2 else None
+    if not dense_group_enabled():
+        return solo()
+    if len(linears) < 2 and fan is None:
+        _dense_group_fallback(
+            "registration",
+            "no fused group is available for this single-shard module",
+        )
+        return solo()
+    if x_fp16.dtype is not torch.float16 or not x_fp16.is_contiguous() or x_fp16.dim() != 2:
+        _dense_group_fallback(
+            "input",
+            "input must be contiguous 2D fp16",
+            fan.get("group_id") if fan else None,
+        )
+        return solo()
+    if out_dtype is not torch.float32:
+        _dense_group_fallback("dtype", f"unsupported C dtype {out_dtype}", fan.get("group_id") if fan else None)
+        return solo()
+    m = x_fp16.numel() // int(x_fp16.shape[-1])
+    if m > 16 or m < 1:
+        _dense_group_fallback("rows", f"rows={m} outside fused range 1..16", fan.get("group_id") if fan else None)
+        return solo()
+
+    if mode == 2 and fan is None and _dense_fan_spec(getattr(module, "prefix", None)) is not None:
+        _, base, _ = _dense_fan_spec(getattr(module, "prefix", None))
+        _dense_group_fallback(
+            "registration",
+            "T1 fan is not complete; using the registered local T0 group",
+            f"{base}:fan",
+        )
+
+    if mode == 2 and fan is not None and len(fan["member_ids"]) > 1:
+        group_id = fan["group_id"]
+        if fan.get("prewarm_failed"):
+            _dense_group_fallback("prewarm", "fan was not prewarmed", group_id)
+            return solo()
+        if int(x_fp16.shape[1]) != int(fan["k"]):
+            _dense_group_fallback("input", f"fan k={fan['k']} got {x_fp16.shape[1]}", group_id)
+            return solo()
+        source = source_tensor if source_tensor is not None else x_fp16
+        if source.dim() != 2 or not source.is_contiguous():
+            _dense_group_fallback("input", "source must be contiguous 2D", group_id)
+            return solo()
+        base = source
+        while getattr(base, "_base", None) is not None:
+            base = base._base
+        source_key = (
+            id(base),
+            int(source.data_ptr()),
+            tuple(source.shape),
+            source.dtype,
+            str(source.device),
+        )
+        stream = int(torch.cuda.current_stream(x_fp16.device).cuda_stream)
+        cache = fan.get("cache")
+        module_id = id(module)
+        all_ids = fan["member_ids"]
+        if cache is not None and cache["source_key"] == source_key and cache["m"] == m:
+            if cache["stream"] != stream:
+                _dense_group_fallback("stream", f"trigger stream changed {cache['stream']}->{stream}", group_id)
+                return solo()
+            cache["used"].add(module_id)
+            positions = fan["member_positions"].get(module_id)
+            if positions is None:
+                _dense_group_fallback("registration", "caller is not a registered member", group_id)
+                return solo()
+            result = [cache["outs"][idx] for idx in positions]
+            if cache["used"] == all_ids:
+                fan["last_completed"] = {
+                    "source_key": source_key,
+                    "m": m,
+                    "stream": stream,
+                }
+                fan["cache"] = None
+                pool = _dense_group_shared_pool(fan, out_dtype)
+                if pool is not None and pool["owner"] == group_id:
+                    pool["owner"] = None
+            return result
+        if cache is not None and cache["used"] != all_ids:
+            _dense_group_fallback(
+                "input",
+                "new input arrived before the prior owner generation was complete",
+                group_id,
+            )
+            return solo()
+        positions = fan["member_positions"].get(module_id)
+        if positions is None:
+            _dense_group_fallback("registration", "owner is not a registered member", group_id)
+            return solo()
+        completed = fan.get("last_completed")
+        if (
+            completed is not None
+            and completed["source_key"] == source_key
+            and completed["m"] == m
+            and completed["stream"] != stream
+        ):
+            _dense_group_fallback(
+                "stream",
+                f"completed generation stream changed {completed['stream']}->{stream}",
+                group_id,
+            )
+            return solo()
+        pool = _dense_group_shared_pool(fan, out_dtype)
+        if pool is None:
+            _dense_group_fallback("scratch", "shared pool is unavailable", group_id)
+            return solo()
+        if pool["owner"] not in (None, group_id):
+            _dense_group_fallback(
+                "scratch",
+                f"shared pool is busy with {pool['owner']}",
+                group_id,
+            )
+            return solo()
+        pool["owner"] = group_id
+        fan["generation"] += 1
+        try:
+            outs = _exl3_group_mgemm(fan, x_fp16, out_dtype)
+        except Exception as exc:
+            if pool["owner"] == group_id:
+                pool["owner"] = None
+            _dense_group_fallback("error", repr(exc), group_id)
+            return solo()
+        fan["cache"] = {
+            "generation": fan["generation"],
+            "source_key": source_key,
+            "source_ref": base,
+            "m": m,
+            "stream": stream,
+            "used": {module_id},
+            "outs": outs,
+        }
+        _dense_group_active(2, group_id)
+        return [outs[idx] for idx in positions]
+
+    group = getattr(module, "_exl3_dense_group", None)
+    if group is None and not hasattr(module, "_exl3_dense_group"):
+        if torch.cuda.is_current_stream_capturing():
+            _dense_group_fallback("capture", "group tables missing during capture")
+            return solo()
+        build_exl3_dense_group(module)
+        group = getattr(module, "_exl3_dense_group", None)
+    if not group:
+        _dense_group_fallback(
+            "registration",
+            "dense group tables are unavailable",
+            fan.get("group_id") if fan is not None else None,
+        )
+        return solo()
+    pool = _dense_group_shared_pool(group, out_dtype)
+    if pool is None:
+        _dense_group_fallback("scratch", "shared pool is unavailable", group.get("group_id"))
+        return solo()
+    if mode == 1 and pool["owner"] is not None and pool["owner"] != group["group_id"]:
+        # A prior T1 graph capture may contain only its owner trigger.  The
+        # caller has explicitly switched modes, so its cached fan generation
+        # is no longer eligible to claim the shared pool.
+        pool["owner"] = None
+    if pool["owner"] not in (None, group["group_id"]):
+        _dense_group_fallback(
+            "scratch",
+            f"shared pool is busy with {pool['owner']}",
+            group["group_id"],
+        )
+        return solo()
+    try:
+        outs = _exl3_group_mgemm(group, x_fp16, out_dtype)
+        _dense_group_active(1, group["group_id"])
+        return outs
+    except Exception as exc:
+        _dense_group_fallback("error", repr(exc), group.get("group_id"))
+        return solo()
 
 
 def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
@@ -284,6 +1027,519 @@ def apply_exl3_python_loop(
     return out
 
 
+
+
+# ---------------------------------------------------------------------------
+# LNA routed-expert MoE kernels: F1 ``lna`` and F3 ``lna2``
+#
+# F3c (2026-09-04): ported from vllm-exl3-v030-port/src/vllm_exl3/exl3.py into
+# this production tree.  The two improvements had to live in one file: the seat
+# mounts PLUGIN_SRC as a whole directory, so loading the port's tree to get
+# lna2 deleted the T0/T1 dense-group code and `run_exl3_group` silently fell
+# back through `except ImportError` (REPORT-F3-seat2.md §4).
+#
+# ONLY what lna2/lna need is ported.  Deliberately NOT brought over: the native
+# p2b fused path, the EP loader changes, and everything else in the 0.3.0 port.
+# The native extension is still the port's src/vllm_exl3_c*.so, mounted by the
+# seat via NATIVE_SO and imported here exactly as before (importlib on
+# "vllm_exl3_c"), so no build in this tree changes.
+#
+# Default behaviour is unchanged: VLLM_EXL3_MOE_KERNEL is unset -> "auto" ->
+# "exllamav3", i.e. the incumbent fused kernel, and none of the code below runs.
+# ---------------------------------------------------------------------------
+
+
+def get_moe_kernel_backend() -> str:
+    """Resolve ``VLLM_EXL3_MOE_KERNEL`` for this tree.
+
+    Differs from the 0.3.0 port on purpose: there is no ``native`` p2b path in
+    this tree, so ``auto`` resolves to the incumbent ``exllamav3`` and ``native``
+    is not an accepted value.
+    """
+    requested = os.environ.get("VLLM_EXL3_MOE_KERNEL", "auto").strip().lower()
+    if requested not in {"lna", "lna2", "exllamav3", "auto"}:
+        logger.warning(
+            "Unknown VLLM_EXL3_MOE_KERNEL=%r; using auto selection", requested
+        )
+        requested = "auto"
+    if requested == "auto":
+        return "exllamav3"
+    return requested
+
+
+def moe_kernel_strict() -> int:
+    """F3b: VLLM_EXL3_MOE_STRICT turns silent fallbacks into hard errors.
+
+    The F3 seat gate passed a full serving run while measuring the incumbent,
+    because `lna2` declined every call and fell back to exllamav3 without one log
+    line (REPORT-F3-seat.md §2).  Two levels, because not every decline is a bug:
+
+      1 = raise when the kernel is not READY (extension missing, preflight
+          failed, pointer tables absent).  That is always a configuration
+          error.  Shape declines still only log -- prefill legitimately
+          declines, and level 1 must be safe to run in production.
+      2 = also raise on shape declines.  Gate-only: it proves every MoE call
+          went through the kernel, so no measurement can be taken against the
+          incumbent by accident.
+    """
+    try:
+        return int(os.environ.get("VLLM_EXL3_MOE_STRICT", "0") or 0)
+    except ValueError:
+        return 0
+
+
+# F3b: observable proof of which kernel actually ran.  A gate asserts on these.
+_MOE_CALLS = {"lna": 0, "lna2": 0}
+
+
+def moe_kernel_call_counts() -> dict[str, int]:
+    """Per-backend count of calls that actually reached the LNA kernels."""
+    return dict(_MOE_CALLS)
+
+
+def reset_moe_kernel_call_counts() -> None:
+    for k in _MOE_CALLS:
+        _MOE_CALLS[k] = 0
+
+
+def moe_kernel_declined_reasons() -> list[str]:
+    """Reasons the lna2 path declined so far (one entry per distinct reason)."""
+    return sorted(_LNA2_REJECT_LOGGED)
+
+
+_LNA2_ACTIVE_LOGGED = False
+
+
+def _lna2_log_active() -> None:
+    """One-shot positive confirmation that the F3 lna2 MoE kernel is live."""
+    global _LNA2_ACTIVE_LOGGED
+    if not _LNA2_ACTIVE_LOGGED:
+        _LNA2_ACTIVE_LOGGED = True
+        logger.warning("F3 LNA2 MoE kernel ACTIVE (VLLM_EXL3_MOE_KERNEL=lna2)")
+
+
+_LNA1_REJECT_LOGGED = set()
+
+
+def _lna1_log_reject(layer) -> None:
+    """F3b: the F1 path declined too, and used to do it in complete silence."""
+    why = "lna_ready=%s error=%s" % (
+        getattr(layer, "_exl3_lna_ready", None), getattr(layer, "_exl3_lna_error", None))
+    if why not in _LNA1_REJECT_LOGGED and len(_LNA1_REJECT_LOGGED) < 12:
+        _LNA1_REJECT_LOGGED.add(why)
+        logger.warning("F1 LNA declined (falling back to exllamav3): %s", why)
+    if moe_kernel_strict() >= 2 or (
+        moe_kernel_strict() >= 1 and not getattr(layer, "_exl3_lna_ready", False)
+    ):
+        raise RuntimeError(
+            f"VLLM_EXL3_MOE_KERNEL=lna with VLLM_EXL3_MOE_STRICT, but the "
+            f"lna kernel declined: {why}"
+        )
+
+
+_LNA2_REJECT_LOGGED = set()
+
+
+def _lna2_log_reject(why: str, *, not_ready: bool = False) -> None:
+    """One-shot per-reason log of why the F3 lna2 kernel declined a call.
+
+    `not_ready` marks the class of decline that is always a bug (extension or
+    preflight), as opposed to a shape the kernel is not meant to serve."""
+    if why not in _LNA2_REJECT_LOGGED and len(_LNA2_REJECT_LOGGED) < 12:
+        _LNA2_REJECT_LOGGED.add(why)
+        logger.warning("F3 LNA2 declined (falling back to exllamav3): %s", why)
+    level = moe_kernel_strict()
+    if level >= (1 if not_ready else 2):
+        raise RuntimeError(
+            "VLLM_EXL3_MOE_KERNEL=lna2 with VLLM_EXL3_MOE_STRICT=%d, but the "
+            "lna2 kernel declined this call: %s" % (level, why)
+        )
+
+
+def _load_lna2_exl3_ext():
+    """Return the F3 ticket extension only when its entry point is present."""
+    try:
+        module = importlib.import_module("vllm_exl3_c")
+    except Exception:
+        return None
+    return module if callable(getattr(module, "lna2_moe_decode", None)) else None
+
+
+def lna2_moe_kernel_available() -> bool:
+    """Whether the F3 ticket-scheduled routed-expert entry point is available."""
+    return _load_lna2_exl3_ext() is not None
+
+
+_LNA2_MAX_ROWS = None
+
+
+def lna2_max_rows() -> int:
+    """Row ceiling of the compiled lna2 build (LNA2_MAX_M).  Asked, not assumed:
+    the seat's 制式 sits at exactly 4 seqs x DSpark3 = 16 rows, so a hardcoded 16
+    here is a cliff one --max-num-seqs away."""
+    global _LNA2_MAX_ROWS
+    if _LNA2_MAX_ROWS is None:
+        module = _load_lna2_exl3_ext()
+        try:
+            _LNA2_MAX_ROWS = int(module.lna2_moe_max_rows())
+        except Exception:
+            _LNA2_MAX_ROWS = 16
+    return _LNA2_MAX_ROWS
+
+
+def _apply_lna2_moe(
+    x2d: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    layer: torch.nn.Module,
+    inners: list[dict[str, Any]],
+    expert_map: torch.Tensor | None,
+    limit: float,
+) -> torch.Tensor | None:
+    """Run the F3 ticket kernel for its fixed DSV4 decode geometry."""
+    module = _load_lna2_exl3_ext()
+    if module is None or not getattr(layer, "_exl3_lna_ready", False):
+        _lna2_log_reject("module=%s lna_ready=%s lna_error=%s" % (
+            module is not None, getattr(layer, "_exl3_lna_ready", None),
+            getattr(layer, "_exl3_lna_error", None)), not_ready=True)
+        return None
+    if (
+        not x2d.is_cuda
+        or x2d.dim() != 2
+        or not 1 <= int(x2d.shape[0]) <= lna2_max_rows()
+        or int(x2d.shape[1]) != 4096
+        or int(getattr(layer, "_exl3_intermediate_local", -1)) != 256
+        or int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1))) not in (2, 3)
+        or int(ids.shape[-1]) != 6
+    ):
+        _lna2_log_reject("geometry x=%s max_rows=%d inter=%s k=%s topk=%s" % (
+            tuple(x2d.shape), lna2_max_rows(),
+            getattr(layer, "_exl3_intermediate_local", None),
+            getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", None)),
+            int(ids.shape[-1])))
+        return None
+    ptrs = getattr(layer, "_exl3_ptrs", None)
+    if not isinstance(ptrs, dict):
+        _lna2_log_reject("ptrs missing", not_ready=True)
+        return None
+    required = (
+        "gate_trellis", "gate_suh", "gate_svh",
+        "up_trellis", "up_suh", "up_svh",
+        "down_trellis", "down_suh", "down_svh",
+    )
+    if any(key not in ptrs for key in required):
+        _lna2_log_reject("ptr table incomplete", not_ready=True)
+        return None
+    n_exp = len(inners)
+    local = map_topk_to_local(ids, n_exp, expert_map).reshape(ids.shape)
+    safe_ids = local.to(dtype=torch.int32).contiguous()
+    route_weights = weights.reshape_as(local).to(dtype=torch.float32).contiguous()
+    scratch = _lna2_scratch_for(layer, module, x2d.device)
+    out = torch.empty_like(x2d)
+    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+    module.lna2_moe_decode(
+        x2d, out,
+        ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+        ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+        ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+        safe_ids, route_weights, k, float(limit), scratch,
+    )
+    _MOE_CALLS["lna2"] += 1
+    return out
+
+
+# F3c: ONE lna2 scratch per device for the whole model.
+#
+# It used to be keyed by (device, stream).  MEASURED (run-67): a second CUDA
+# stream costs 20 MiB -- its own 6.47 MiB scratch plus a fresh caching-allocator
+# segment -- and vLLM captures its decode graphs on a side stream, so the seat
+# was paying for two.  With LNA2_CONCURRENT_STREAMS=1 (the default, and the
+# house setting VLLM_DISABLE_SHARED_EXPERTS_STREAM=1) only one lna2 launch is
+# ever in flight, and the buffer holds nothing across launches, so one buffer
+# per device is correct and a graph captured on any stream can point at it.
+# When the build is sized for concurrent streams the key includes the stream
+# again, because then two launches really can overlap.
+_LNA2_SCRATCH: dict[tuple[int, int], torch.Tensor] = {}
+_LNA2_STREAMS = None
+
+
+def _lna2_concurrent_streams(module) -> int:
+    global _LNA2_STREAMS
+    if _LNA2_STREAMS is None:
+        try:
+            _LNA2_STREAMS = int(module.lna2_moe_info(2)[13])
+        except Exception:
+            _LNA2_STREAMS = 1
+    return _LNA2_STREAMS
+
+
+def _lna2_scratch_for(layer: torch.nn.Module, module, device: torch.device) -> torch.Tensor:
+    """Shared lna2 scratch, zeroed once on creation.
+
+    Zeroed, not empty: the scheduler control region (next ticket, retired count,
+    per-team ticket, barrier counters/sense, team flags) must start at zero.  It
+    self-resets afterwards, so there is no per-launch memset and nothing extra
+    inside a CUDA graph."""
+    dev_index = device.index if device.index is not None else torch.cuda.current_device()
+    if _lna2_concurrent_streams(module) > 1:
+        key = (int(dev_index), int(torch.cuda.current_stream(device).cuda_stream))
+    else:
+        key = (int(dev_index), 0)
+    scratch = _LNA2_SCRATCH.get(key)
+    if scratch is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("F3 LNA2 scratch was not prewarmed for this device")
+        scratch = torch.zeros(
+            int(module.lna2_moe_scratch_bytes()), dtype=torch.uint8, device=device
+        )
+        _LNA2_SCRATCH[key] = scratch
+    return scratch
+
+
+def lna2_scratch_bytes_resident() -> int:
+    """Total bytes currently held by the shared lna2 scratch on this process."""
+    return sum(int(t.numel()) for t in _LNA2_SCRATCH.values())
+
+
+def _load_lna_exl3_ext():
+    """Return the F1 extension only when its dedicated entry point is present."""
+    try:
+        module = importlib.import_module("vllm_exl3_c")
+    except Exception:
+        return None
+    return module if callable(getattr(module, "lna_moe_decode", None)) else None
+
+
+def lna_moe_kernel_available() -> bool:
+    """Whether the F1 single-launch routed-expert entry point is available."""
+    return _load_lna_exl3_ext() is not None
+
+
+def _validate_lna_pointer_contract(
+    inners: list[dict[str, Any]], hidden: int, intermediate: int, bits: int
+) -> None:
+    """Validate the fixed F1 ABI before raw pointer tables enter a graph."""
+    if hidden != 4096 or intermediate != 256:
+        raise ValueError(
+            f"F1 LNA requires hidden=4096/intermediate=256, got {hidden}/{intermediate}"
+        )
+    if bits not in (2, 3):
+        raise ValueError(f"F1 LNA requires K2 or K3, got {bits}")
+    expected = {
+        "gate": ((hidden // 16, intermediate // 16, 16 * bits), hidden, intermediate),
+        "up": ((hidden // 16, intermediate // 16, 16 * bits), hidden, intermediate),
+        "down": ((intermediate // 16, hidden // 16, 16 * bits), intermediate, hidden),
+    }
+    if not inners:
+        raise ValueError("F1 LNA requires at least one routed expert")
+    device = None
+    for expert, pack in enumerate(inners):
+        for which in ("gate", "up", "down"):
+            linear = pack[which]
+            trellis = linear.trellis
+            suh = linear.suh
+            svh = linear.svh
+            shape, suh_n, svh_n = expected[which]
+            if tuple(int(v) for v in trellis.shape) != shape:
+                raise ValueError(
+                    f"expert {expert} {which}.trellis shape {tuple(trellis.shape)} != {shape}"
+                )
+            if trellis.dtype != torch.int16 or not trellis.is_contiguous():
+                raise ValueError(f"expert {expert} {which}.trellis must be contiguous int16")
+            if suh.dtype != torch.float16 or suh.numel() != suh_n or not suh.is_contiguous():
+                raise ValueError(f"expert {expert} {which}.suh must be contiguous fp16[{suh_n}]")
+            if svh.dtype != torch.float16 or svh.numel() != svh_n or not svh.is_contiguous():
+                raise ValueError(f"expert {expert} {which}.svh must be contiguous fp16[{svh_n}]")
+            # F3 seat gate 2026-09-04: exllamav3 LinearEXL3 keeps the marker tensor in
+            # ``mcg_tensor``; ``mcg`` is a bool flag.  Reading ``mcg`` raised
+            # AttributeError('bool' object has no attribute 'numel') and left
+            # _exl3_lna_ready=False, so lna/lna2 never ran in the seat.
+            marker = getattr(linear, "mcg_tensor", None)
+            if marker is None:
+                marker = getattr(linear, "mcg", None)
+            if isinstance(marker, bool):
+                marker = None
+            if marker is None or marker.numel() == 0 or not bool(
+                torch.all(marker.reshape(-1) == MCG_MARKER_SIGNED_INT32).item()
+            ):
+                raise ValueError(f"expert {expert} {which}.mcg is not the MCG marker")
+            for tensor_name, tensor in (("trellis", trellis), ("suh", suh), ("svh", svh)):
+                if tensor.device.type != "cuda":
+                    raise ValueError(f"expert {expert} {which}.{tensor_name} is not CUDA")
+                if tensor.data_ptr() % 2:
+                    raise ValueError(f"expert {expert} {which}.{tensor_name} is not 2-byte aligned")
+                if device is None:
+                    device = tensor.device
+                elif tensor.device != device:
+                    raise ValueError(f"expert {expert} {which}.{tensor_name} is on the wrong device")
+
+
+def _lna_scratch_for(layer: torch.nn.Module, module, device: torch.device) -> torch.Tensor:
+    """Return scratch reserved for this CUDA stream; never allocate in capture."""
+    cache = getattr(layer, "_exl3_lna_scratch", None)
+    if cache is None:
+        cache = {}
+        layer._exl3_lna_scratch = cache
+    stream = torch.cuda.current_stream(device)
+    key = int(stream.cuda_stream)
+    scratch = cache.get(key)
+    if scratch is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("F1 LNA scratch was not prewarmed for the capture stream")
+        nbytes = int(module.lna_moe_scratch_bytes())
+        scratch = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        cache[key] = scratch
+    return scratch
+
+
+def _prepare_lna_state(
+    layer: torch.nn.Module, inners: list[dict[str, Any]], backend: str = "lna"
+) -> None:
+    """Preflight the requested LNA backend and reserve its scratch.
+
+    F3b: this is backend-aware.  It used to allocate F1's per-layer scratch
+    unconditionally, so running lna2 paid for BOTH kernels -- 3.320 MiB (F1) +
+    3.236 MiB (F3) per layer per stream, ~0.4 GiB/GPU, which shrank the 制式
+    window 389,120 -> 263,424 (REPORT-F3-seat.md §5).  Now `lna` allocates only
+    F1's scratch and `lna2` allocates only the shared F3 one.
+    """
+    layer._exl3_lna_scratch = {}
+    layer._exl3_lna_ready = False
+    try:
+        hidden = int(layer._exl3_hidden_size)
+        intermediate = int(layer._exl3_intermediate_local)
+        bits = int(getattr(layer, "_exl3_bits", -1))
+        device = inners[0]["gate"].trellis.device
+        stream = torch.cuda.current_stream(device)
+
+        if backend == "lna2":
+            module = _load_lna2_exl3_ext()
+            if module is None:
+                layer._exl3_lna_error = "vllm_exl3_c.lna2_moe_decode is unavailable"
+                return
+            _validate_lna_pointer_contract(inners, hidden, intermediate, bits)
+            module.lna2_moe_prepare(bits)
+            # Shared across every layer on this (device, stream); creating it
+            # here just makes sure it exists before any CUDA graph capture.
+            _lna2_scratch_for(layer, module, device)
+        else:
+            module = _load_lna_exl3_ext()
+            if module is None:
+                layer._exl3_lna_error = "vllm_exl3_c.lna_moe_decode is unavailable"
+                return
+            _validate_lna_pointer_contract(inners, hidden, intermediate, bits)
+            for cap in (4, 8, 16):
+                module.lna_moe_prepare(bits, cap)
+            layer._exl3_lna_scratch[int(stream.cuda_stream)] = torch.empty(
+                int(module.lna_moe_scratch_bytes()), dtype=torch.uint8, device=device
+            )
+
+        layer._exl3_lna_ready = True
+        layer._exl3_lna_error = None
+    except Exception as exc:
+        layer._exl3_lna_error = repr(exc)
+        # F3b: this except used to swallow everything, which is exactly how the
+        # mcg/mcg_tensor bug hid.  Say so, and refuse to continue in strict mode.
+        logger.warning(
+            "F3/F1 LNA preflight FAILED for %s (backend=%s): %r -- the MoE will "
+            "fall back to exllamav3",
+            getattr(layer, "prefix", "?"), backend, exc,
+        )
+        if moe_kernel_strict():
+            raise
+
+
+def _apply_lna_moe(
+    x2d: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    layer: torch.nn.Module,
+    inners: list[dict[str, Any]],
+    expert_map: torch.Tensor | None,
+    limit: float,
+) -> torch.Tensor | None:
+    """Run the F1 single-launch kernel for its fixed DSV4 decode geometry."""
+    module = _load_lna_exl3_ext()
+    if module is None or not getattr(layer, "_exl3_lna_ready", False):
+        return None
+    if (
+        not x2d.is_cuda
+        or x2d.dim() != 2
+        or not 1 <= int(x2d.shape[0]) <= 16
+        or int(x2d.shape[1]) != 4096
+        or int(getattr(layer, "_exl3_intermediate_local", -1)) != 256
+        or int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1))) not in (2, 3)
+        or int(ids.shape[-1]) != 6
+    ):
+        return None
+    ptrs = getattr(layer, "_exl3_ptrs", None)
+    if not isinstance(ptrs, dict):
+        return None
+    required = (
+        "gate_trellis", "gate_suh", "gate_svh",
+        "up_trellis", "up_suh", "up_svh",
+        "down_trellis", "down_suh", "down_svh",
+    )
+    if any(key not in ptrs for key in required):
+        return None
+    n_exp = len(inners)
+    local = map_topk_to_local(ids, n_exp, expert_map).reshape(ids.shape)
+    safe_ids = local.to(dtype=torch.int32).contiguous()
+    route_weights = weights.reshape_as(local).to(dtype=torch.float32).contiguous()
+    scratch = _lna_scratch_for(layer, module, x2d.device)
+    out = torch.empty_like(x2d)
+    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+    result = module.lna_moe_decode(
+        x2d,
+        out,
+        ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+        ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+        ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+        safe_ids,
+        route_weights,
+        k,
+        float(limit),
+        scratch,
+    )
+    if isinstance(result, torch.Tensor) and result is not out:
+        out.copy_(result)
+    _MOE_CALLS["lna"] += 1
+
+    # Selfcheck is deliberately eager-only: the Python reference allocates and
+    # synchronizes, neither of which may enter a CUDA graph capture.
+    n_chk = int(os.environ.get("LNA_EXL3_NATIVE_SELFCHECK", "0") or 0)
+    if n_chk > 0 and not torch.cuda.is_current_stream_capturing():
+        done = int(getattr(layer, "_exl3_lna_selfcheck_done", 0))
+        if done < n_chk:
+            layer._exl3_lna_selfcheck_done = done + 1
+            ref = apply_exl3_python_loop(x2d, ids, weights, inners, expert_map, limit)
+            out32 = out.float()
+            rel = float(((out32 - ref).norm() / (ref.norm() + 1e-6)).item())
+            repeat = torch.empty_like(out)
+            module.lna_moe_decode(
+                x2d, repeat,
+                ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
+                ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
+                ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
+                safe_ids, route_weights, k, float(limit), scratch,
+            )
+            torch.cuda.synchronize(x2d.device)
+            bitwise = bool(torch.equal(out, repeat))
+            finite = bool(torch.isfinite(out32).all().item())
+            logger.info(
+                "F1 LNA selfcheck %s call=%d m=%d K=%d rel=%.6g bitwise=%s finite=%s",
+                getattr(layer, "prefix", "?"), done + 1, int(x2d.shape[0]),
+                k, rel, bitwise, finite,
+            )
+            if (rel > 2e-3 or not bitwise or not finite) and os.environ.get(
+                "LNA_EXL3_NATIVE_STRICT", "0"
+            ) == "1":
+                raise RuntimeError(
+                    f"F1 LNA selfcheck failed rel={rel} bitwise={bitwise} finite={finite}"
+                )
+    return out
+
+
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
     import exllamav3_ext
@@ -328,6 +1584,14 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     layer._exl3_k = int(layer._exl3_bits)
+    # F3c: preflight the LNA kernels only when one is actually requested.  This
+    # is what sets _exl3_lna_ready and reserves the scratch; without it the lna2
+    # path returns None on every call and falls back to exllamav3 in silence,
+    # which is exactly how the first seat gate measured the incumbent while
+    # believing it measured lna2 (REPORT-F3-seat.md §2).
+    backend = get_moe_kernel_backend()
+    if backend in {"lna", "lna2"}:
+        _prepare_lna_state(layer, inners, backend)
 
 
 def apply_exl3_fused_moe(
@@ -458,6 +1722,43 @@ def apply_exl3_experts(
     ids = topk_ids.reshape(tokens, -1).to(torch.long)
     weights = topk_weights.reshape(tokens, -1)
     expert_map = pin_exl3_expert_map(layer, x2d.device)
+
+    # F3c: LNA routed-expert kernels.  Only reached when VLLM_EXL3_MOE_KERNEL
+    # names one; otherwise this whole block is skipped and the incumbent runs.
+    backend = get_moe_kernel_backend()
+    if backend == "lna2" and fused is not False:
+        try:
+            lna2_out = _apply_lna2_moe(
+                x2d, ids, weights, layer, inners, expert_map, limit
+            )
+        except Exception as exc:
+            # Strict must not be swallowed by the fallback handler: that is the
+            # same shape of bug as the silent decline it exists to catch.
+            if moe_kernel_strict():
+                raise
+            lna2_out = None
+            layer._exl3_lna2_error = repr(exc)
+            logger.warning_once("F3 LNA2 dispatch failed; falling back: %s", exc)
+        if lna2_out is not None:
+            layer._exl3_last_apply = "lna2"
+            _lna2_log_active()
+            return lna2_out.to(dtype=x.dtype)
+    elif backend == "lna" and fused is not False:
+        try:
+            lna_out = _apply_lna_moe(
+                x2d, ids, weights, layer, inners, expert_map, limit
+            )
+        except Exception as exc:
+            if moe_kernel_strict():
+                raise
+            lna_out = None
+            layer._exl3_lna_error = repr(exc)
+            logger.warning_once("F1 LNA dispatch failed; falling back: %s", exc)
+        if lna_out is not None:
+            layer._exl3_last_apply = "lna"
+            return lna_out.to(dtype=x.dtype)
+        _lna1_log_reject(layer)
+
     have_ptrs = bool(getattr(layer, "_exl3_ptrs", None))
     if fused is True and not have_ptrs:
         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
@@ -1410,6 +2711,10 @@ class Exl3LinearMethod(LinearMethodBase):
 
         layer._exl3_linears = linears
 
+        # LNA-LAB: F2 T0 — register the shard group (pointer tables) before the
+        # prewarm below tunes it, so graph capture lands on the tuned mgemm.
+        build_exl3_dense_group(layer)
+
         # LNA-LAB: pre-tune the EXL3 cooperative GEMM for the decode row counts before vLLM
         # captures CUDA graphs. The exllamav3 autotuner times candidates with events and
         # stream syncs, which is illegal during capture; warming the launch/disk cache here
@@ -1419,11 +2724,19 @@ class Exl3LinearMethod(LinearMethodBase):
             try:
                 dev = linears[0].trellis.device if linears and linears[0] is not None else None
                 if dev is not None:
+                    n_exl3 = sum(1 for lin in linears if lin is not None)
                     for r in (int(v) for v in prewarm.split(",") if v.strip()):
                         for lin in linears:
                             if lin is not None:
                                 x = torch.zeros((r, int(lin.in_features)), dtype=torch.float16, device=dev)
                                 lin.forward(x, {}, out_dtype=torch.float32)
+                        # F2 T0: tune the fused group too — exl3_mgemm skips autotune
+                        # silently while capturing and would bake the static heuristic.
+                        if getattr(layer, "_exl3_dense_group", None) and n_exl3 > 1:
+                            xg = torch.zeros(
+                                (r, int(linears[0].in_features)), dtype=torch.float16, device=dev
+                            )
+                            run_exl3_group(layer, xg, torch.float32)
                     torch.cuda.synchronize(dev)
             except Exception as exc:  # pragma: no cover - diagnostic only
                 logger.warning("EXL3 prewarm skipped for %s: %s", getattr(layer, "prefix", "?"), exc)
@@ -1487,26 +2800,38 @@ class Exl3LinearMethod(LinearMethodBase):
 
         # Run each shard in declared order
         outputs = []
-        for i in range(n_shards):
-            if i in bf16_shards:
-                # BF16 shard: use dense linear
-                if bf16_weight is None:
-                    raise RuntimeError(
-                        f"EXL3 bf16 shard {i} but _exl3_bf16_weight is missing"
-                    )
-                bf16_idx = bf16_shards.index(i)
-                out_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
-                out_end = out_start + output_sizes[i]
-                w_shard = bf16_weight[out_start:out_end]
-                out = F.linear(x_2d, w_shard).to(dtype=torch.float32)
-                outputs.append(out)
-            else:
-                # EXL3 shard
-                linear = linears[i]
-                if linear is None:
-                    raise RuntimeError(f"EXL3 linear shard {i} is None")
-                out = linear.forward(x_fp16, {}, out_dtype=torch.float32)
-                outputs.append(out)
+        if not bf16_shards and (
+            n_shards > 1
+            or (dense_group_mode() == 2 and getattr(layer, "_exl3_dense_fan", None) is not None)
+        ):
+            # LNA-LAB: F2 T0 — same-input shards of this one module call go
+            # through the dense-group runner (one exl3_mgemm when
+            # LNA_EXL3_DENSE_GROUP=1/2; otherwise the identical solo forwards).
+            # bf16 shards and single-shard layers keep the literal loop below.
+            outputs = run_exl3_group(
+                layer, x_fp16, torch.float32, source_tensor=x_2d
+            )
+        else:
+            for i in range(n_shards):
+                if i in bf16_shards:
+                    # BF16 shard: use dense linear
+                    if bf16_weight is None:
+                        raise RuntimeError(
+                            f"EXL3 bf16 shard {i} but _exl3_bf16_weight is missing"
+                        )
+                    bf16_idx = bf16_shards.index(i)
+                    out_start = sum(output_sizes[j] for j in bf16_shards[:bf16_idx])
+                    out_end = out_start + output_sizes[i]
+                    w_shard = bf16_weight[out_start:out_end]
+                    out = F.linear(x_2d, w_shard).to(dtype=torch.float32)
+                    outputs.append(out)
+                else:
+                    # EXL3 shard
+                    linear = linears[i]
+                    if linear is None:
+                        raise RuntimeError(f"EXL3 linear shard {i} is None")
+                    out = linear.forward(x_fp16, {}, out_dtype=torch.float32)
+                    outputs.append(out)
 
         # Concatenate shards along output dimension
         if len(outputs) > 1:
